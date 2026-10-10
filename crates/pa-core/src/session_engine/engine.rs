@@ -623,6 +623,17 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // over the timing-instrumented fn (TS `sdk.ts` instruments first, the
     // `AgentSession` constructor wraps semantic edges over it). The side
     // question keeps the pre-semantic fn, so its calls carry no id.
+    // Temporary gateway integration: do not enable session-scoped behavior
+    // in other providers (notably Codex WebSocket connection reuse).
+    let stream_fn: StreamFn = Arc::new(move |model, context, mut options| {
+        if model.provider == "shady2k-gateway" {
+            options
+                .headers
+                .get_or_insert_with(std::collections::BTreeMap::new)
+                .insert("x-session-affinity".to_string(), agent_session_id.clone());
+        }
+        stream_fn(model, context, options)
+    });
     let timing_stream_fn = super::request_timing::instrument_stream_fn(
         std::sync::Arc::clone(&request_timing_wiring),
         stream_fn,
@@ -638,7 +649,6 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         None => timing_stream_fn,
     };
     let agent = Agent::new(AgentOptions {
-        session_id: Some(agent_session_id),
         initial_state: AgentInitialState {
             system_prompt: Some(system_prompt.clone()),
             model: Some(model),

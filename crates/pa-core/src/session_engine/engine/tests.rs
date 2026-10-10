@@ -382,7 +382,7 @@ fn session_id_test_config(
         id: "m".into(),
         name: "m".into(),
         api: "test".into(),
-        provider: "test".into(),
+        provider: "shady2k-gateway".into(),
         base_url: "http://localhost".into(),
         reasoning: false,
         cost: pa_agent::types::UsageCost::default(),
@@ -403,10 +403,14 @@ fn session_id_test_config(
         agent_dir: agent_dir.to_path_buf(),
         model: Some(model),
         stream_fn: Some(Arc::new(move |model, context, options| {
-            recorded_ids
-                .lock()
-                .unwrap()
-                .push(options.session_id.clone());
+            assert!(options.session_id.is_none());
+            recorded_ids.lock().unwrap().push(
+                options
+                    .headers
+                    .as_ref()
+                    .and_then(|headers| headers.get("x-session-affinity"))
+                    .cloned(),
+            );
             stream(model, context, options)
         })),
         tools: vec![bridge_tool(echo_definition())],
@@ -417,7 +421,7 @@ fn session_id_test_config(
 }
 
 #[tokio::test]
-async fn stream_session_id_survives_turns_and_resume_but_changes_for_new_session() {
+async fn gateway_affinity_survives_turns_and_resume_but_changes_for_new_session() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("project");
     std::fs::create_dir_all(&cwd).unwrap();
@@ -487,7 +491,7 @@ async fn stream_session_id_survives_turns_and_resume_but_changes_for_new_session
 }
 
 #[tokio::test]
-async fn stream_session_id_uses_daemon_durable_log_not_in_memory_manager() {
+async fn gateway_affinity_uses_daemon_durable_log_not_in_memory_manager() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("project");
     std::fs::create_dir_all(&cwd).unwrap();
@@ -518,4 +522,25 @@ async fn stream_session_id_uses_daemon_durable_log_not_in_memory_manager() {
         engine.session.agent().wait_for_idle().await;
     }
     assert_eq!(*ids.lock().unwrap(), vec![Some(saved_id); 4]);
+}
+
+#[tokio::test]
+async fn gateway_affinity_does_not_enable_codex_session_reuse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut config = session_id_test_config(
+        tmp.path(),
+        &tmp.path().join("agent"),
+        SessionManager::in_memory(tmp.path()),
+        None,
+        Arc::clone(&ids),
+    );
+    config.model.as_mut().unwrap().provider = "openai-codex".to_string();
+    let engine = create_session(config).await.unwrap();
+    engine
+        .prompt("use echo", PromptOptions::default())
+        .await
+        .unwrap();
+    engine.session.agent().wait_for_idle().await;
+    assert_eq!(*ids.lock().unwrap(), vec![None, None]);
 }
