@@ -370,3 +370,152 @@ async fn create_session_registers_goal_and_heartbeat_handlers() {
         "tools: {names:?}"
     );
 }
+
+fn session_id_test_config(
+    cwd: &std::path::Path,
+    agent_dir: &std::path::Path,
+    session_manager: SessionManager,
+    conversation_log_path: Option<PathBuf>,
+    recorded_ids: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+) -> SessionEngineConfig {
+    let model = pa_agent::types::Model {
+        id: "m".into(),
+        name: "m".into(),
+        api: "test".into(),
+        provider: "test".into(),
+        base_url: "http://localhost".into(),
+        reasoning: false,
+        cost: pa_agent::types::UsageCost::default(),
+        context_window: 100_000,
+        max_tokens: 100,
+        max_tokens_explicit: false,
+    };
+    let provider = Arc::new(ScriptedProvider::new(model.clone()));
+    provider.push_tool_call_turn(
+        None,
+        vec![("call-1", "echo", serde_json::json!({"text": "hi"}))],
+    );
+    provider.push_text_turn("done");
+    provider.push_text_turn("done again");
+    let stream = provider.stream_fn();
+    SessionEngineConfig {
+        cwd: cwd.to_path_buf(),
+        agent_dir: agent_dir.to_path_buf(),
+        model: Some(model),
+        stream_fn: Some(Arc::new(move |model, context, options| {
+            recorded_ids
+                .lock()
+                .unwrap()
+                .push(options.session_id.clone());
+            stream(model, context, options)
+        })),
+        tools: vec![bridge_tool(echo_definition())],
+        session_manager: Some(session_manager),
+        conversation_log_path,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn stream_session_id_survives_turns_and_resume_but_changes_for_new_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let session_dir = tmp.path().join("sessions");
+    let manager = SessionManager::persisted(&cwd, &session_dir);
+    let saved_id = manager.get_session_id().to_string();
+    let saved_file = manager.get_session_file().unwrap().to_path_buf();
+    let ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let engine = create_session(session_id_test_config(
+        &cwd,
+        &tmp.path().join("agent"),
+        manager,
+        None,
+        Arc::clone(&ids),
+    ))
+    .await
+    .unwrap();
+    for prompt in ["first prompt", "second prompt"] {
+        engine
+            .prompt(prompt, PromptOptions::default())
+            .await
+            .unwrap();
+        engine.session.agent().wait_for_idle().await;
+    }
+    assert_eq!(*ids.lock().unwrap(), vec![Some(saved_id.clone()); 3]);
+    drop(engine);
+
+    let resumed = SessionManager::open(&cwd, &session_dir, &saved_file);
+    assert_eq!(resumed.get_session_id(), saved_id);
+    let engine = create_session(session_id_test_config(
+        &cwd,
+        &tmp.path().join("agent"),
+        resumed,
+        None,
+        Arc::clone(&ids),
+    ))
+    .await
+    .unwrap();
+    engine
+        .prompt("resumed prompt", PromptOptions::default())
+        .await
+        .unwrap();
+    engine.session.agent().wait_for_idle().await;
+    assert_eq!(*ids.lock().unwrap(), vec![Some(saved_id.clone()); 5]);
+    drop(engine);
+
+    let new_manager = SessionManager::persisted(&cwd, &session_dir);
+    let new_id = new_manager.get_session_id().to_string();
+    assert_ne!(new_id, saved_id);
+    let engine = create_session(session_id_test_config(
+        &cwd,
+        &tmp.path().join("agent"),
+        new_manager,
+        None,
+        Arc::clone(&ids),
+    ))
+    .await
+    .unwrap();
+    engine
+        .prompt("new prompt", PromptOptions::default())
+        .await
+        .unwrap();
+    engine.session.agent().wait_for_idle().await;
+    let mut expected = vec![Some(saved_id); 5];
+    expected.extend(vec![Some(new_id); 2]);
+    assert_eq!(*ids.lock().unwrap(), expected);
+}
+
+#[tokio::test]
+async fn stream_session_id_uses_daemon_durable_log_not_in_memory_manager() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let session_dir = tmp.path().join("sessions");
+    let mut durable = SessionManager::persisted(&cwd, &session_dir);
+    durable.flush_now().unwrap();
+    let saved_id = durable.get_session_id().to_string();
+    let saved_file = durable.get_session_file().unwrap().to_path_buf();
+    let ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Each worker boot gets a fresh in-memory manager; the durable header
+    // is the session identity, including after a worker restart.
+    for _ in 0..2 {
+        let manager = SessionManager::in_memory_in_session_dir(&cwd, &session_dir);
+        assert_ne!(manager.get_session_id(), saved_id);
+        let engine = create_session(session_id_test_config(
+            &cwd,
+            &tmp.path().join("agent"),
+            manager,
+            Some(saved_file.clone()),
+            Arc::clone(&ids),
+        ))
+        .await
+        .unwrap();
+        engine
+            .prompt("daemon prompt", PromptOptions::default())
+            .await
+            .unwrap();
+        engine.session.agent().wait_for_idle().await;
+    }
+    assert_eq!(*ids.lock().unwrap(), vec![Some(saved_id); 4]);
+}

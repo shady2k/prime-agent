@@ -177,6 +177,18 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     let mut session_manager = config
         .session_manager
         .unwrap_or_else(|| SessionManager::in_memory(&cwd));
+    // Daemon workers use an in-memory manager while their host owns the
+    // durable log. Its header, not the worker's fresh ID, owns affinity.
+    let agent_session_id = match config.conversation_log_path.as_deref() {
+        Some(path) if !session_manager.is_persisted() => {
+            crate::session::manager::read_session_header(path)
+                .map(|header| header.id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("could not read session identity from {}", path.display())
+                })?
+        }
+        _ => session_manager.get_session_id().to_string(),
+    };
     let owns_resume_settings =
         session_manager.is_persisted() || config.conversation_log_path.is_none();
     let conversation_log = {
@@ -626,6 +638,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         None => timing_stream_fn,
     };
     let agent = Agent::new(AgentOptions {
+        session_id: Some(agent_session_id),
         initial_state: AgentInitialState {
             system_prompt: Some(system_prompt.clone()),
             model: Some(model),
